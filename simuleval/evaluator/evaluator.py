@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 from .instance import INSTANCE_TYPE_DICT, LogInstance
 from .scorers import get_scorer_class
-from .scorers.latency_scorer import LatencyScorer
+from .scorers.latency_scorer import LatencyScorer, load_ctm_to_dict, load_text_alignments, compute_ideal_delays, load_data_ids
 from .scorers.quality_scorer import QualityScorer
 from ..utils.visualize import Visualize
 
@@ -72,6 +72,7 @@ class SentenceLevelEvaluator(object):
         latency_scorers: Dict[str, LatencyScorer],
         args: Namespace,
     ) -> None:
+        
         self.dataloader = dataloader
         self.quality_scorers = quality_scorers
         self.latency_scorers = latency_scorers
@@ -83,10 +84,20 @@ class SentenceLevelEvaluator(object):
         self.no_scoring = args.no_scoring
         self.source_segment_size = getattr(args, "source_segment_size", 1)
         self.source_type = getattr(args, "source_type", None)
+        self.ctm_path = getattr(args, "ctm_path", None)
+        self.t2t_align_path = getattr(args, "t2t_align_path", None)
         self.target_type = getattr(args, "target_type", None)
         self.visualize = args.visualize
-
+        
         self.target_spm_model = None
+        self.ideal_delays = None
+        self.data_ids = load_data_ids(getattr(args, "source", None))
+        self.ctm = load_ctm_to_dict(self.ctm_path, self.data_ids) if self.ctm_path else None
+        self.t2t_align, self.parallel_sentences = load_text_alignments(self.t2t_align_path, self.data_ids) if self.t2t_align_path else (None, None)
+        # precompute ideal alignments
+        if self.t2t_align and self.ctm:
+            self.ideal_delays = compute_ideal_delays(self.ctm, self.t2t_align, self.parallel_sentences)
+
         if args.eval_latency_unit == "spm":
             assert args.eval_latency_spm_model
             assert IS_IMPORT_SPM
@@ -245,6 +256,11 @@ class SentenceLevelEvaluator(object):
             return instance.source_finished_reading
         return instance.finish_prediction
 
+    def get_utt_id(self, instance):
+        utt_path = instance.source_info[0]
+        return Path(utt_path).stem
+
+
     def make_visual(self):
         with open(self.output / "instances.log", "r") as file:
             for line in file:
@@ -282,7 +298,10 @@ class SentenceLevelEvaluator(object):
                         # end yet. We are going to clear the state and continue
                         # processing the rest of the input.
                         system.reset()
-
+                if self.ideal_delays:
+                    utt_id = self.get_utt_id(instance)
+                    instance.ideal_delays = self.ideal_delays[utt_id]["ideal_delay"]
+                    instance.ref_align_words = self.ideal_delays[utt_id]["words"]
                 if not self.score_only and self.output:
                     file.write(json.dumps(instance.summarize()) + "\n")
 

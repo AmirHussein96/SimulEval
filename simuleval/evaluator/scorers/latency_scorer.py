@@ -5,10 +5,17 @@
 # LICENSE file in the root directory of this source tree.
 
 from statistics import mean
+from collections import defaultdict
 from pathlib import Path
+import string
+import re
+import os
 import subprocess
 import logging
 import textgrid
+import torch
+import transformers
+import itertools
 import sys
 import shutil
 from typing import List, Union, Dict
@@ -37,6 +44,309 @@ def register_latency_scorer(name):
 
     return register
 
+_PUNCT_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)*|[^\w\s]")
+
+def split_word_and_punct(token: str):
+    return _PUNCT_RE.findall(token)
+
+def remove_sentence_punctuation(text: str) -> str:
+    return re.sub(r"[.,?!:;]", "", text)
+
+def load_ctm_to_dict(ctm_path: str, data_ids: List[str]) -> Dict[str, List[dict]]:
+    """
+    Load a CTM file into a dictionary indexed by utterance ID.
+
+    Expected CTM format (space-separated):
+        utt_id channel start_time duration word [confidence]
+
+    Returns:
+        {
+            utt_id: [
+                {
+                    "symbol": str,
+                    "start": float,
+                    "duration": float,
+                },
+                ...
+            ]
+        }
+    """
+    alignment_dict = defaultdict(list)
+    with open(ctm_path, "r") as f:
+        for line_num, line in enumerate(f, 1):
+            parts = line.strip().split()
+            if len(parts) < 5:
+                logger.warning(
+                    "Skipping malformed CTM line %d in %s: %r",
+                    line_num,
+                    ctm_path,
+                    line.strip(),
+                )
+                continue
+            utt_id, _, start, duration, symbol = parts[:5]
+            if data_ids and utt_id not in data_ids:
+                continue
+            else:
+                alignment_dict[utt_id].append(
+                    {"symbol": symbol, "start": float(start), "duration": float(duration)}
+                )
+    for utt_id in alignment_dict:
+        alignment_dict[utt_id].sort(key=lambda x: x["start"])
+    return alignment_dict
+
+def load_data_ids(source_path: str):
+    data_ids = []
+    with open(source_path, "r") as f:
+        for line in f:
+            data_ids.append(Path(line).stem)
+    return data_ids
+
+def load_text_alignments(alignment_path: str, data_ids: List[str]) -> Dict[str, List[tuple]]:
+    """
+    Load Awesome-Align output and return a mapping from utterance ID
+    to aligned (src_index, tgt_index) token pairs.
+
+    Expected files inside alignment_path:
+        - awesome-align.out  (token alignments per line)
+        - ids                (utterance IDs, one per line)
+
+    Returns:
+        {
+            utt_id: [(src_idx, tgt_idx), ...]
+        }
+    """
+
+    alignment_file = os.path.join(alignment_path, "awesome-align.out")
+    ids_file = os.path.join(alignment_path, "awesome-align.ids")
+    parallel_file = os.path.join(alignment_path, "awesome-align.parallel")
+
+    if not os.path.isfile(alignment_file):
+        raise FileNotFoundError(f"Missing alignment file: {alignment_file}")
+    if not os.path.isfile(ids_file):
+        raise FileNotFoundError(f"Missing ids file: {ids_file}")
+    
+    alignment_dict = defaultdict(list)
+    parallel_sentences = defaultdict(list)
+    with open(alignment_file, "r") as align_f, open(ids_file, "r") as ids_f, open(parallel_file, "r") as para_f:
+        for line_num, (align_line, id_line, para_line) in enumerate(
+            zip(align_f, ids_f, para_f), start=1
+        ):
+            pairs = []
+            for token in align_line.strip().split():
+                try:
+                    src, tgt = map(int, token.split('-'))
+                    pairs.append((src, tgt))
+                except ValueError:
+                    logger.warning(
+                        "Malformed alignment token at line %d (%s): %r",
+                        line_num,
+                        utt_id,
+                        token,
+                    )
+            utt_id = id_line.strip().split(".")[0]
+            if data_ids and utt_id not in data_ids:
+                continue
+            else:
+                alignment_dict[utt_id] = pairs
+                para_line = para_line.strip()
+                src, tgt = map(str.strip, para_line.split("|||", 1))
+                parallel_sentences[utt_id] = (src, tgt)
+    return alignment_dict, parallel_sentences
+
+
+def mono_text_alignment(text_alignment, num_src_words, num_tgt_words):
+    """
+    Convert text-to-text word alignments into a monotonic target-to-source map.
+    Args:
+        text_alignment (List[Tuple[int, int]]):
+            Word alignments as (src_idx, tgt_idx), 0-based.
+        num_src_words (int): Number of source words.
+        num_tgt_words (int): Number of target words.
+
+    Returns:
+        ali_no_dup (List[Tuple[int, int]]):
+            Monotonic, de-duplicated alignments.
+        tgt2src (Dict[int, int]):
+            Mapping from each target word index to a source word index with monotonicity.
+    """
+    
+    if (num_src_words-1, num_tgt_words - 1) not in text_alignment:
+        text_alignment.append((num_src_words - 1, num_tgt_words - 1))
+    # remove alignments larger than number of words in source and target
+    text_alignment = [(i, j) for (i, j) in text_alignment if i < num_src_words and j < num_tgt_words] 
+    # 1) sort by target then source
+    sorted_text_alignment = sorted(text_alignment, key=lambda x: (x[1], x[0]))
+    # 2) remove consecutive duplicates in tgt (keep last)
+    ali_no_dup = []
+
+    for a in sorted_text_alignment:
+        if ali_no_dup and ali_no_dup[-1][1] == a[1]:
+            ali_no_dup[-1] = a
+        else:
+            ali_no_dup.append(a)
+    # 3) enforce monotonic src
+    for i, a in enumerate(ali_no_dup):
+        if i == 0:
+            continue
+        ali_no_dup[i] = (max(a[0], ali_no_dup[i - 1][0]), a[1])
+
+    tgt2src = {}
+    for a in ali_no_dup:
+        tgt2src[a[1]] = a[0]
+    for i in range(num_tgt_words - 1, -1, -1):
+        if i not in tgt2src:
+            tgt2src[i] = tgt2src[i + 1]
+
+    return ali_no_dup, tgt2src
+
+def add_src_traj(src_alignment, tgt2src):
+    """
+    Merge source CTM word alignments into source trajectory steps based on
+    target-to-source word alignment pivots.
+    Args:
+        src_alignment (dict): CTM alignments for one utterance.
+        tgt2src (dict): Mapping from target word index to source word index.
+
+    Returns:
+        src_traj (List[str]): Space-joined source words per trajectory step.
+        merged_alignments (List[dict]): Merged CTM timing per step.
+    """
+    # 2. Pivots = unique sorted source positions from tgt2src
+    pivot_src = sorted(set(tgt2src.values())) 
+    # Compute chunking info
+    src_traj = [[] for _ in range(len(pivot_src))]
+    merged_alignments = [None for _ in range(len(pivot_src))]
+  
+    src_prev_step_idx = []
+    traj_idx = 0
+    for i,item in enumerate(src_alignment):
+        # Calculate the frame index for the END of the word
+        if i > pivot_src[traj_idx]:
+            traj_idx += 1
+        
+        if merged_alignments[traj_idx] is None:
+            merged_alignments[traj_idx] = item
+            prev = merged_alignments[traj_idx]
+            src_prev_step_idx.append(traj_idx)
+        else:
+            new_item = {"symbol": " ".join([prev["symbol"], item["symbol"]]),
+                        "start": prev["start"],
+                        "duration": item["start"]+item["duration"] - prev["start"],
+                        }
+            merged_alignments[traj_idx] = new_item
+            prev = merged_alignments[traj_idx]
+            src_prev_step_idx.append(traj_idx)
+
+        src_traj[traj_idx].append(item["symbol"])
+    # Convert to list of space-joined word strings per chunk
+    src_traj = [' '.join(words) for words in src_traj]
+    return src_traj, merged_alignments
+
+def compute_ideal_delays(ctm_alignments, t2t_alignments, parallel_sentences, split_punctuation=True):
+    """
+        Compute ideal word-level target delays using CTM-based source timing
+        and text-to-text word alignments.
+        Args:
+            ctm_alignments (dict): CTM word alignments per utterance.
+            t2t_alignments (dict): Text-to-text word alignment indices.
+            parallel_sentences (dict): Utterance ID → (source, target) sentences.
+        Returns:
+            dict:
+                {
+                    utt_id: {
+                        "ideal_delay": List[float],  # per target word
+                        "words": List[str],
+                    }
+                }
+    """
+    ideal_delays = defaultdict(lambda: {"ideal_delay": [], "words": []})
+    for utt_id in ctm_alignments.keys():
+        if not ctm_alignments[utt_id] or utt_id not in t2t_alignments:
+            continue
+        parallel = parallel_sentences[utt_id]
+        src_words = parallel[0].split()
+        tgt_words = parallel[1].split()
+        ali_no_dup, tgt2src = mono_text_alignment(t2t_alignments[utt_id], len(src_words), len(tgt_words))
+        src_traj, src_merged_alignments = add_src_traj(ctm_alignments[utt_id], tgt2src)
+
+        # get the target trajectory
+        idx2step = []
+        for i in range(len(src_traj)):
+            n_word = len(src_traj[i].split(' ')) - (src_traj[i] == '')
+            idx2step.extend([i] * n_word)
+        tgt_traj = [[] for _ in range(len(src_traj))]
+    
+        for i in range(len(tgt_words)):   
+            src_word_idx = tgt2src[i]
+            src_step_idx = idx2step[src_word_idx]
+            tgt_traj[src_step_idx].append(tgt_words[i])
+
+        for i in range(len(tgt_traj)):
+            # ideal delay in milliseconds
+            ideal_delay = (src_merged_alignments[i]["start"] + src_merged_alignments[i]["duration"])*1000
+            for word in tgt_traj[i]:
+                if split_punctuation:
+                    sub_tokens = split_word_and_punct(word)
+                else:
+                    sub_tokens = [word]
+
+                ideal_delays[utt_id]["words"].extend(sub_tokens)
+                ideal_delays[utt_id]["ideal_delay"].extend(
+                    [ideal_delay] * len(sub_tokens)
+                )
+
+        assert len(ideal_delays[utt_id]["ideal_delay"]) == len(ideal_delays[utt_id]["words"]), (
+            f"[{utt_id}] delays/words length mismatch: "
+            f"{len(ideal_delays[utt_id]['ideal_delay'])} vs {len(ideal_delays[utt_id]['words'])}"
+        )
+    return ideal_delays
+
+def generate_t2t_alignment(src: str, tgt: str) -> Dict[int, int]:
+    """
+        Generate target→source word alignment using soft intersection.
+
+        Args:
+            src: source sentence (string)
+            tgt: target sentence (string)
+
+        Returns:
+            tgt2src: Dict[target_word_index → source_word_index]
+    """
+    model = transformers.BertModel.from_pretrained('bert-base-multilingual-cased')
+    tokenizer = transformers.BertTokenizer.from_pretrained('bert-base-multilingual-cased')
+    # pre-processing
+    sent_src, sent_tgt = src.strip().split(), tgt.strip().split()
+    token_src, token_tgt = [tokenizer.tokenize(word) for word in sent_src], [tokenizer.tokenize(word) for word in sent_tgt]
+    wid_src, wid_tgt = [tokenizer.convert_tokens_to_ids(x) for x in token_src], [tokenizer.convert_tokens_to_ids(x) for x in token_tgt]
+    ids_src, ids_tgt = tokenizer.prepare_for_model(list(itertools.chain(*wid_src)), return_tensors='pt', model_max_length=tokenizer.model_max_length, truncation=True)['input_ids'], tokenizer.prepare_for_model(list(itertools.chain(*wid_tgt)), return_tensors='pt', truncation=True, model_max_length=tokenizer.model_max_length)['input_ids']
+    sub2word_map_src = []
+    for i, word_list in enumerate(token_src):
+        sub2word_map_src += [i for x in word_list]
+    sub2word_map_tgt = []
+    for i, word_list in enumerate(token_tgt):
+        sub2word_map_tgt += [i for x in word_list]
+    # alignment
+    align_layer = 8
+    threshold = 1e-3
+    model.eval()
+    with torch.no_grad():
+        out_src = model(ids_src.unsqueeze(0), output_hidden_states=True)[2][align_layer][0, 1:-1]
+        out_tgt = model(ids_tgt.unsqueeze(0), output_hidden_states=True)[2][align_layer][0, 1:-1]
+
+        dot_prod = torch.matmul(out_src, out_tgt.transpose(-1, -2))
+
+        softmax_srctgt = torch.nn.Softmax(dim=-1)(dot_prod)
+        softmax_tgtsrc = torch.nn.Softmax(dim=-2)(dot_prod)
+
+        softmax_inter = (softmax_srctgt > threshold)*(softmax_tgtsrc > threshold)
+
+    align_subwords = torch.nonzero(softmax_inter, as_tuple=False)
+    align_words = set()
+    for i, j in align_subwords:
+        align_words.add( (sub2word_map_src[i], sub2word_map_tgt[j]) )
+    align_words = [(i, j) for (i, j) in align_words if i < len(sent_src) and j < len(sent_tgt)] 
+    tgt2src = {j:i for i,j in align_words}
+    return tgt2src
 
 class LatencyScorer:
     metric = None
@@ -69,7 +379,6 @@ class LatencyScorer:
         """
         delays = getattr(ins, self.timestamp_type, None)
         assert delays
-
         if not self.use_ref_len or ins.reference is None:
             tgt_len = len(delays)
         else:
@@ -110,6 +419,44 @@ class LatencyScorer:
             use_ref_len=not args.no_use_ref_len,
         )
 
+
+@register_latency_scorer("MAAL")
+class MAALScorer(LatencyScorer):
+
+    def compute(self, ins: Instance):
+        """
+        Function to compute latency on one sentence (instance).
+
+        Args:
+            ins Instance: one instance
+
+        Returns:
+            float: the latency score on one sentence.
+        """
+        pred_delays, source_length, _ = self.get_delays_lengths(ins)
+        ideal_delays = getattr(ins, "ideal_delays", None)
+        ref_align_words = getattr(ins, "ref_align_words", None)
+        prediction = ins.prediction
+        delays = []
+        clean_ref = remove_sentence_punctuation(" ".join(ref_align_words))
+        avg_delay = source_length/len(clean_ref.split())    # avg milisseconds per reference word
+        # get alignment between pred and ref using awesome align 
+        tgt2pred = generate_t2t_alignment(prediction, ' '.join(ref_align_words))
+        for tgt_idx in range(len(ref_align_words)):
+            ref_word = ref_align_words[tgt_idx]
+            if ref_word in string.punctuation:
+                continue
+            if tgt_idx not in tgt2pred:
+                # deletion penalty
+                # delays.append(source_length - ideal_delays[tgt_idx]*1000)
+                # One average-word-time later than its oracle position
+                delays.append(avg_delay)
+            else:
+                pred_idx = tgt2pred[tgt_idx]
+                delays.append(max(pred_delays[pred_idx] - ideal_delays[tgt_idx], 0))
+            
+        return sum(delays) / max(1, len(delays))
+    
 
 @register_latency_scorer("AL")
 class ALScorer(LatencyScorer):

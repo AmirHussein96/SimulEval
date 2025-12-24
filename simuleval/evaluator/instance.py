@@ -64,6 +64,8 @@ class Instance(object):
         self.delays = []
         self.start_time = None
         self.metrics = {}
+        self.ideal_delays = None
+        self.ref_align_words = None
 
     def step_to_elapsed(self, *args):
         raise NotImplementedError
@@ -142,6 +144,10 @@ class Instance(object):
         }
         if self.latency_unit == "spm":
             return_dict["prediction_spm"] = self.prediction_list
+        if self.ideal_delays:
+            return_dict["ideal_delays"] = self.ideal_delays
+        if self.ref_align_words:
+            return_dict["ref_align_words"] = self.ref_align_words
         return return_dict
 
     @classmethod

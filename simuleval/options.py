@@ -121,6 +121,18 @@ def add_evaluator_args(parser: argparse.ArgumentParser):
         default=None,
         help="Output directory. Required if using iterable dataloader.",
     )
+    parser.add_argument(
+        "--ctm-path",
+        type=str,
+        default=None,
+        help="Path to directory containing source-side CTM files",
+    )
+    parser.add_argument(
+        "--t2t-align-path",
+        type=str,
+        default=None,
+        help="Path to directory containing text-to-text alignment files",
+    )
 
 
 def add_scorer_args(
