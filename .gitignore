@@ -139,4 +139,4 @@ cython_debug/
 .vscode
 
 # Mac files
-.DS_Store
+.DS_Storeexamples/speech_to_text/output/
