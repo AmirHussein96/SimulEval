@@ -41,6 +41,27 @@ The results of the evaluation should be as following. The detailed results can b
  100.0  822.018  822.018  0.581  1061.271  2028.555
 ```
 
+### Example: Evaluating with the MAAL latency metric
+
+```bash
+    simuleval \
+        --agent maal_dummy_agent.py \
+        --source-segment-size 1000 \
+        --latency-metrics MAAL LAAL \
+        --source maal_source.txt \
+        --target reference/maal_reference.txt \
+        --output output \
+        --ctm-path reference/words.combined.ctm \
+        --t2t-align-path reference`
+```
+The results of the evaluation should be as following. The detailed results can be found in the `output` directory.
+
+```
+ BLEU    MAAL   LAAL
+7.583 930.533 2733.0
+```
+
+
 ### Example Streaming ASR / S2T: Whipser Wait-K model
 
 This section provide a more realistic model. [whisper_waitk.py](whisper_waitk.py) is a streaming ASR agent running [wait-k](https://aclanthology.org/P19-1289/) policy on the [Whisper](https://github.com/openai/whisper) ASR model

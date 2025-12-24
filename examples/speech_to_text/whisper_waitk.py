@@ -56,7 +56,6 @@ class WaitkWhisper(SpeechToTextAgent):
             length_in_seconds = 0
         else:
             length_in_seconds = float(len(states.source)) / states.source_sample_rate
-        breakpoint()
         if not states.source_finished:
             if (
                 length_in_seconds * 1000 / self.source_segment_size
