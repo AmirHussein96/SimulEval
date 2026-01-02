@@ -420,7 +420,6 @@ class LatencyScorer:
             use_ref_len=not args.no_use_ref_len,
         )
 
-
 @register_latency_scorer("MAAL")
 class MAALScorer(LatencyScorer):
 

@@ -97,7 +97,6 @@ class SentenceLevelEvaluator(object):
         # precompute ideal alignments
         if self.t2t_align and self.ctm:
             self.ideal_delays = compute_ideal_delays(self.ctm, self.t2t_align, self.parallel_sentences)
-
         if args.eval_latency_unit == "spm":
             assert args.eval_latency_spm_model
             assert IS_IMPORT_SPM
