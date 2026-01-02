@@ -7,6 +7,7 @@
 from statistics import mean
 from collections import defaultdict
 from pathlib import Path
+import numpy as np
 import string
 import re
 import os
@@ -438,8 +439,9 @@ class MAALScorer(LatencyScorer):
         ref_align_words = getattr(ins, "ref_align_words", None)
         prediction = ins.prediction
         delays = []
+        count_deletions = 0
         clean_ref = remove_sentence_punctuation(" ".join(ref_align_words))
-        avg_delay = source_length/len(clean_ref.split())    # avg milisseconds per reference word
+        # avg_delay = source_length/len(clean_ref.split())    # avg milisseconds per reference word
         # get alignment between pred and ref using awesome align 
         tgt2pred = generate_t2t_alignment(prediction, ' '.join(ref_align_words))
         for tgt_idx in range(len(ref_align_words)):
@@ -450,10 +452,16 @@ class MAALScorer(LatencyScorer):
                 # deletion penalty
                 # delays.append(source_length - ideal_delays[tgt_idx]*1000)
                 # One average-word-time later than its oracle position
-                delays.append(avg_delay)
+                # delays.append(avg_delay)
+                count_deletions += 1
             else:
                 pred_idx = tgt2pred[tgt_idx]
                 delays.append(max(pred_delays[pred_idx] - ideal_delays[tgt_idx], 0))
+        if delays:
+            penalty = np.percentile(delays, 90)
+        else:
+            penalty = source_length
+        delays.extend([penalty] * count_deletions)
             
         return sum(delays) / max(1, len(delays))
     
