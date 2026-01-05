@@ -72,7 +72,7 @@ def load_ctm_to_dict(ctm_path: str, data_ids: List[str]) -> Dict[str, List[dict]
             ]
         }
     """
-    alignment_dict = defaultdict(list)
+    alignment_dict = {}
     with open(ctm_path, "r") as f:
         for line_num, line in enumerate(f, 1):
             parts = line.strip().split()
@@ -88,6 +88,8 @@ def load_ctm_to_dict(ctm_path: str, data_ids: List[str]) -> Dict[str, List[dict]
             if data_ids and utt_id not in data_ids:
                 continue
             else:
+                if utt_id not in alignment_dict:
+                    alignment_dict[utt_id] = []
                 alignment_dict[utt_id].append(
                     {"symbol": symbol, "start": float(start), "duration": float(duration)}
                 )
@@ -126,8 +128,8 @@ def load_text_alignments(alignment_path: str, data_ids: List[str]) -> Dict[str, 
     if not os.path.isfile(ids_file):
         raise FileNotFoundError(f"Missing ids file: {ids_file}")
     
-    alignment_dict = defaultdict(list)
-    parallel_sentences = defaultdict(list)
+    alignment_dict = {}
+    parallel_sentences = {}
     with open(alignment_file, "r") as align_f, open(ids_file, "r") as ids_f, open(parallel_file, "r") as para_f:
         for line_num, (align_line, id_line, para_line) in enumerate(
             zip(align_f, ids_f, para_f), start=1
@@ -148,9 +150,13 @@ def load_text_alignments(alignment_path: str, data_ids: List[str]) -> Dict[str, 
             if data_ids and utt_id not in data_ids:
                 continue
             else:
+                if utt_id not in alignment_dict:
+                    alignment_dict[utt_id] = []
                 alignment_dict[utt_id] = pairs
                 para_line = para_line.strip()
                 src, tgt = map(str.strip, para_line.split("|||", 1))
+                if utt_id not in parallel_sentences:
+                    parallel_sentences[utt_id] = []
                 parallel_sentences[utt_id] = (src, tgt)
     return alignment_dict, parallel_sentences
 
@@ -260,7 +266,7 @@ def compute_ideal_delays(ctm_alignments, t2t_alignments, parallel_sentences, spl
                     }
                 }
     """
-    ideal_delays = defaultdict(lambda: {"ideal_delay": [], "words": []})
+    ideal_delays = {}
     for utt_id in ctm_alignments.keys():
         if not ctm_alignments[utt_id] or utt_id not in t2t_alignments:
             continue
@@ -269,6 +275,7 @@ def compute_ideal_delays(ctm_alignments, t2t_alignments, parallel_sentences, spl
         tgt_words = parallel[1].split()
         if (len(src_words) != len(ctm_alignments[utt_id])):
             continue
+        ideal_delays[utt_id] = {"ideal_delay": [], "words": []}
         ali_no_dup, tgt2src = mono_text_alignment(t2t_alignments[utt_id], len(src_words), len(tgt_words))
         src_traj, src_merged_alignments = add_src_traj(ctm_alignments[utt_id], tgt2src)
 
@@ -421,6 +428,7 @@ class LatencyScorer:
             computation_aware=False,
             use_ref_len=not args.no_use_ref_len,
         )
+
 
 @register_latency_scorer("MAAL")
 class MAALScorer(LatencyScorer):
