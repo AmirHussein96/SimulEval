@@ -267,6 +267,8 @@ def compute_ideal_delays(ctm_alignments, t2t_alignments, parallel_sentences, spl
         parallel = parallel_sentences[utt_id]
         src_words = parallel[0].split()
         tgt_words = parallel[1].split()
+        if (len(src_words) != len(ctm_alignments[utt_id])):
+            continue
         ali_no_dup, tgt2src = mono_text_alignment(t2t_alignments[utt_id], len(src_words), len(tgt_words))
         src_traj, src_merged_alignments = add_src_traj(ctm_alignments[utt_id], tgt2src)
 
