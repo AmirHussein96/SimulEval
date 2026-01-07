@@ -299,8 +299,11 @@ class SentenceLevelEvaluator(object):
                         system.reset()
                 if self.ideal_delays:
                     utt_id = self.get_utt_id(instance)
-                    instance.ideal_delays = self.ideal_delays[utt_id]["ideal_delay"]
-                    instance.ref_align_words = self.ideal_delays[utt_id]["words"]
+                    if utt_id in self.ideal_delays:
+                        instance.ideal_delays = self.ideal_delays[utt_id]["ideal_delay"]
+                        instance.ref_align_words = self.ideal_delays[utt_id]["words"]
+                    else:
+                        continue
                 if not self.score_only and self.output:
                     file.write(json.dumps(instance.summarize()) + "\n")
 
