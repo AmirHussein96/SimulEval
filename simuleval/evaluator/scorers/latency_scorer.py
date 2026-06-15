@@ -311,19 +311,31 @@ def compute_ideal_delays(ctm_alignments, t2t_alignments, parallel_sentences, spl
         )
     return ideal_delays
 
-def generate_t2t_alignment(src: str, tgt: str) -> Dict[int, int]:
+def generate_t2t_alignment(
+    src: str,
+    tgt: str,
+    model: "transformers.BertModel" = None,
+    tokenizer: "transformers.BertTokenizer" = None,
+) -> Dict[int, int]:
     """
-        Generate target→source word alignment using soft intersection.
+    Generate target→source word alignment using BERT soft-intersection.
 
-        Args:
-            src: source sentence (string)
-            tgt: target sentence (string)
+    Args:
+        src: source sentence string.
+        tgt: target sentence string.
+        model: pre-loaded BertModel (multilingual-cased). Loaded once if None.
+        tokenizer: matching BertTokenizer. Loaded once if None.
 
-        Returns:
-            tgt2src: Dict[target_word_index → source_word_index]
+    Returns:
+        tgt2src: Dict mapping target word index → source word index.
+
+    Note:
+        Pass a cached model/tokenizer to avoid reloading on every call.
     """
-    model = transformers.BertModel.from_pretrained('bert-base-multilingual-cased')
-    tokenizer = transformers.BertTokenizer.from_pretrained('bert-base-multilingual-cased')
+    if model is None:
+        tokenizer = transformers.BertTokenizer.from_pretrained('bert-base-multilingual-cased')
+        model = transformers.BertModel.from_pretrained('bert-base-multilingual-cased')
+        model.eval()
     # pre-processing
     sent_src, sent_tgt = src.strip().split(), tgt.strip().split()
     token_src, token_tgt = [tokenizer.tokenize(word) for word in sent_src], [tokenizer.tokenize(word) for word in sent_tgt]
@@ -410,8 +422,13 @@ class LatencyScorer:
                     )
             delays = getattr(ins, self.timestamp_type, None)
             if delays is None or len(delays) == 0:
-                logger.warn(f"Instance {index} has no delay information. Skipped")
+                logger.warning(f"Instance {index} has no delay information. Skipped")
                 continue
+            # CAAL requires word-level alignment data pre-attached to the instance.
+            if isinstance(self, CAALScorer):
+                if getattr(ins, "ref_align_words", None) is None or getattr(ins, "ideal_delays", None) is None:
+                    logger.warning(f"Instance {index} missing ref_align_words/ideal_delays for CAAL. Skipped")
+                    continue
             score = self.compute(ins)
             ins.metrics[self.metric_name] = score
             scores.append(score)
@@ -430,48 +447,100 @@ class LatencyScorer:
         )
 
 
-@register_latency_scorer("MAAL")
-class MAALScorer(LatencyScorer):
+@register_latency_scorer("CAAL")
+class CAALScorer(LatencyScorer):
+    """
+    Continuous Average Alignment Latency (CAAL).
+
+    Measures how much each predicted word lags behind its ideal emission time,
+    defined by CTM-based source timing and text-to-text word alignments.
+    Requires --ctm-path and --t2t-align-path to be supplied so that
+    ideal_delays and ref_align_words are pre-computed on each instance.
+    """
+
+    def __init__(self, computation_aware: bool = False, use_ref_len: bool = True, clean_ref: bool = True) -> None:
+        super().__init__(computation_aware=computation_aware, use_ref_len=use_ref_len)
+        self.clean_ref = clean_ref
+        # Loaded once on first use; reused across all sentences.
+        self._bert_model = None
+        self._bert_tokenizer = None
+
+    def _get_bert(self):
+        if self._bert_model is None:
+            self._bert_tokenizer = transformers.BertTokenizer.from_pretrained(
+                "bert-base-multilingual-cased"
+            )
+            self._bert_model = transformers.BertModel.from_pretrained(
+                "bert-base-multilingual-cased"
+            )
+            self._bert_model.eval()
+        return self._bert_model, self._bert_tokenizer
+
+    @staticmethod
+    def add_args(parser: ArgumentParser):
+        parser.add_argument(
+            "--no-clean-ref",
+            action="store_true",
+            default=False,
+            help="Disable punctuation removal from the reference before CAAL alignment.",
+        )
+
+    @classmethod
+    def from_args(cls, args: Namespace):
+        return cls(
+            computation_aware=False,
+            use_ref_len=not args.no_use_ref_len,
+            clean_ref=not args.no_clean_ref,
+        )
 
     def compute(self, ins: Instance):
         """
-        Function to compute latency on one sentence (instance).
+        Compute CAAL for one instance.
 
-        Args:
-            ins Instance: one instance
+        Preconditions:
+            ins.ref_align_words must be a List[str] of reference words aligned to
+            the source CTM (populated from --ctm-path / --t2t-align-path).
+            ins.ideal_delays must be a List[float] of the same length (ms per word).
+            Both are set by the evaluator before this method is called; if either
+            is missing the instance is skipped in __call__.
 
         Returns:
-            float: the latency score on one sentence.
+            float: mean per-word latency penalty in milliseconds.
         """
         pred_delays, source_length, _ = self.get_delays_lengths(ins)
         ideal_delays = getattr(ins, "ideal_delays", None)
         ref_align_words = getattr(ins, "ref_align_words", None)
+        if ref_align_words is None or ideal_delays is None:
+            logger.warning(
+                "Instance %s missing ref_align_words or ideal_delays — skipping CAAL.",
+                getattr(ins, "index", "?"),
+            )
+            return 0.0
         prediction = ins.prediction
         delays = []
         count_deletions = 0
-        clean_ref = remove_sentence_punctuation(" ".join(ref_align_words))
-        # avg_delay = source_length/len(clean_ref.split())    # avg milisseconds per reference word
-        # get alignment between pred and ref using awesome align 
-        tgt2pred = generate_t2t_alignment(prediction, ' '.join(ref_align_words))
+        ref_text = " ".join(ref_align_words)
+        clean_ref = remove_sentence_punctuation(ref_text) if self.clean_ref else ref_text
+        model, tokenizer = self._get_bert()
+        tgt2pred = generate_t2t_alignment(prediction, " ".join(ref_align_words), model, tokenizer)
         for tgt_idx in range(len(ref_align_words)):
             ref_word = ref_align_words[tgt_idx]
             if ref_word in string.punctuation:
                 continue
             if tgt_idx not in tgt2pred:
-                # deletion penalty
-                # delays.append(source_length - ideal_delays[tgt_idx]*1000)
-                # One average-word-time later than its oracle position
-                # delays.append(avg_delay)
                 count_deletions += 1
             else:
                 pred_idx = tgt2pred[tgt_idx]
+                if pred_idx >= len(pred_delays):
+                    # alignment pointed past the end of the prediction; treat as deletion
+                    count_deletions += 1
+                    continue
                 delays.append(max(pred_delays[pred_idx] - ideal_delays[tgt_idx], 0))
         if delays:
             penalty = np.percentile(delays, 90)
         else:
             penalty = source_length
         delays.extend([penalty] * count_deletions)
-            
         return sum(delays) / max(1, len(delays))
     
 

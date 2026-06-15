@@ -97,6 +97,15 @@ class SentenceLevelEvaluator(object):
         # precompute ideal alignments
         if self.t2t_align and self.ctm:
             self.ideal_delays = compute_ideal_delays(self.ctm, self.t2t_align, self.parallel_sentences)
+
+        # CAAL requires word-level alignments from --ctm-path and --t2t-align-path
+        if "CAAL" in latency_scorers and self.ideal_delays is None:
+            raise ValueError(
+                "CAAL latency metric requires both --ctm-path and --t2t-align-path to be provided. "
+                "Please supply the CTM force-alignment file and text-to-text alignment file, "
+                "or remove CAAL from --latency-metrics."
+            )
+
         if args.eval_latency_unit == "spm":
             assert args.eval_latency_spm_model
             assert IS_IMPORT_SPM
@@ -178,6 +187,12 @@ class SentenceLevelEvaluator(object):
             self.build_instances_from_dataloader()
 
     def build_instances_from_log(self):
+        """
+        Load instances from instances.log for --score-only mode.
+        Also re-attaches ideal_delays and ref_align_words from self.ideal_delays
+        (computed from --ctm-path / --t2t-align-path) so that CAAL scoring works
+        even when those fields were not present in the original log.
+        """
         self.instances = {}
         if self.output is not None:
             with open(self.output / "instances.log", "r") as f:
@@ -186,6 +201,13 @@ class SentenceLevelEvaluator(object):
                     index = instance.index - self.start_index
                     self.instances[index] = instance
                     self.instances[index].set_target_spm_model(self.target_spm_model)
+                    if self.ideal_delays:
+                        source_list = getattr(instance, "source", None)
+                        if source_list:
+                            utt_id = Path(source_list[0]).stem
+                            if utt_id in self.ideal_delays:
+                                instance.ideal_delays = self.ideal_delays[utt_id]["ideal_delay"]
+                                instance.ref_align_words = self.ideal_delays[utt_id]["words"]
 
     def build_instances_from_dataloader(self):
         if isinstance(self.dataloader, IterableDataloader):
